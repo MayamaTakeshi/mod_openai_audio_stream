@@ -28,7 +28,7 @@ portability; set `CMAKE_BUILD_PARALLEL_LEVEL` to override the default:
 ```sh
 cmake -S tests -B build/tests
 cmake --build build/tests --parallel "${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
-ctest --test-dir build/tests --output-on-failure
+(cd build/tests && ctest --output-on-failure)
 ```
 
 These tests compile the same `stream_protocol.cpp` and `base64.cpp` files linked into the FreeSWITCH module. No copied
