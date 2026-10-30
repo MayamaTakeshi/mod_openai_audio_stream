@@ -5,6 +5,14 @@
 
 namespace stream_protocol {
 
+void expand_mono_pcm(int16_t *samples, std::size_t sample_count, unsigned channels) {
+    for (std::size_t i = sample_count; i > 0; --i) {
+        const int16_t sample = samples[i - 1];
+        for (unsigned c = 0; c < channels; ++c) samples[(i - 1) * channels + c] = sample;
+    }
+}
+
+
 JsonMessageType classify_json_message(const char *type) {
     if (!type) {
         return JsonMessageType::Unhandled;

@@ -16,8 +16,9 @@ export CMAKE_BUILD_PARALLEL_LEVEL="${parallel_jobs}"
 BUILD_DIR="${build_root}/unit" "${project_dir}/tests/run-unit.sh" --sanitizers
 
 cmake -S "${project_dir}" -B "${build_root}/module" \
-    -DCMAKE_BUILD_TYPE=RelWithDebInfo
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_MODULE_TESTS=ON
 cmake --build "${build_root}/module" --parallel "${parallel_jobs}"
+(cd "${build_root}/module" && ctest --output-on-failure)
 cmake --install "${build_root}/module"
 ldconfig
 

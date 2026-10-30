@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import concurrent.futures
 import base64
 import json
 import math
@@ -289,6 +290,65 @@ class ModuleIntegrationTest(unittest.TestCase):
         self.assertIsNotNone(disconnected, "mock WebSocket handler did not finish after peer close")
 
         self.restart_after_automatic_cleanup()
+        self.stop_stream()
+
+    def test_reconnect_discards_capture_backlog(self):
+        assert_ok(self, f"uuid_setvar {self.uuid} STREAM_NO_RECONNECT false")
+        before = len(mock_events())
+        self.start_stream(url=MOCK_URL + "/slow-reconnect", start_muted=False)
+        connected = wait_for_event(
+            lambda event: event.get("event") == "connected" and event.get("path") == "/slow-reconnect"
+            and event.get("generation") == 2, before,
+        )
+        self.assertIsNotNone(connected)
+        time.sleep(0.3)
+        early_audio = [event for event in mock_events()[before:]
+                       if event.get("event") == "audio-received"
+                       and 0 <= event["timestamp"] - connected["timestamp"] <= 0.2]
+        self.assertGreater(len(early_audio), 0)
+        self.assertLess(len(early_audio), 20, "reconnect flushed a burst of stale capture audio")
+        self.stop_stream()
+
+    def test_stalled_peer_rejects_excess_sends(self):
+        assert_ok(self, f"uuid_setvar {self.uuid} STREAM_MESSAGE_DEFLATE true")
+        assert_ok(self, f"uuid_setvar {self.uuid} STREAM_SUPPRESS_LOG true")
+        self.start_stream(url=MOCK_URL + "/stall-read")
+        payload = encode_json({"type": "integration.backpressure", "data": "x" * 60000})
+        rejected = False
+        for _ in range(160):
+            result = api(f"uuid_openai_audio_stream {self.uuid} send_json {payload}")
+            if result.startswith("-ERR"):
+                rejected = True
+                break
+        self.assertTrue(rejected, "stalled peer accepted an unbounded outgoing backlog")
+        # Peer reads are paused, so do not wait for its disconnect event here.
+        assert_ok(self, f"uuid_openai_audio_stream {self.uuid} stop")
+
+    def test_receive_limits_close_oversized_messages(self):
+        for path in ("/oversized-declared", "/oversized-fragments", "/oversized-compressed"):
+            before = len(mock_events())
+            self.start_stream(url=MOCK_URL + path)
+            closed = wait_for_event(lambda event: event.get("event") == "limit-close", before)
+            self.assertIsNotNone(closed, f"no close for {path}")
+            self.assertEqual(closed["code"], 1009)
+            self.restart_after_automatic_cleanup()
+            self.stop_stream()
+
+    def test_stop_racing_hangup(self):
+        for _ in range(10):
+            self.start_stream()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                stop = pool.submit(api, f"uuid_openai_audio_stream {self.uuid} stop")
+                hangup = pool.submit(api, f"uuid_kill {self.uuid}")
+                stop.result(timeout=15)
+                hangup.result(timeout=15)
+            self.uuid = self.originate_call()
+            assert_ok(self, f"uuid_setvar {self.uuid} STREAM_DISABLE_AUDIOFILES true")
+            assert_ok(self, f"uuid_setvar {self.uuid} STREAM_NO_RECONNECT true")
+
+    def test_live_unload_is_rejected(self):
+        self.start_stream()
+        assert_error(self, "unload mod_openai_audio_stream")
         self.stop_stream()
 
     def test_invalid_start_arguments_are_rejected(self):

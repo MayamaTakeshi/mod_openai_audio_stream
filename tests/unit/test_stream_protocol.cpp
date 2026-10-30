@@ -104,6 +104,14 @@ void test_utf8_validation() {
 
 int main() {
     int failures = 0;
+    failures += run_test("mono playback preserves stereo duration and channels", [] {
+        int16_t samples[] = {123, -456, 32767, -32768, 0, 0, 0, 0, 99};
+        stream_protocol::expand_mono_pcm(samples, 4, 2);
+        const int16_t expected[] = {123, 123, -456, -456, 32767, 32767, -32768, -32768, 99};
+        CHECK(std::memcmp(samples, expected, sizeof(samples)) == 0);
+        stream_protocol::expand_mono_pcm(samples, 8, 1);
+        CHECK(std::memcmp(samples, expected, sizeof(samples)) == 0);
+    });
     failures += run_test("message classification", test_message_classification);
     failures += run_test("JSON depth limit", test_json_depth_limit);
     failures += run_test("valid WebSocket URIs", test_valid_websocket_uris);

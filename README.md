@@ -62,6 +62,22 @@ sudo make install
 ```
 **TLS** support is enabled by default. Pass `-DUSE_TLS=OFF` to CMake to build without TLS support; that build supports `ws://` endpoints but not `wss://` endpoints.
 
+### Runtime limits and upgrades
+
+The module remains loaded until FreeSWITCH exits. Installing a new module binary requires a
+FreeSWITCH restart; live `unload` / `reload` is rejected so active calls cannot retain callbacks
+into unloaded code.
+
+Incoming WebSocket messages are limited to 8 MiB, including the total across fragments and the
+decompressed payload. Oversized messages close the connection with code 1009. The build applies
+`patches/ixwebsocket-receive-limits.patch` to a build-local copy of the pinned IXWebSocket source;
+`patch` is required when configuring CMake.
+
+Outgoing sends accept payloads up to 512 KiB and stop accepting more while the WebSocket backlog
+exceeds 512 KiB. Audio is dropped during congestion; `send_json` reports failure if it cannot
+queue its payload. Capture accumulated during a disconnect is discarded on reconnection.
+Playback remains mono on the wire and is duplicated into every destination codec channel.
+
 ### Getting started
 
 #### A simple dialplan example

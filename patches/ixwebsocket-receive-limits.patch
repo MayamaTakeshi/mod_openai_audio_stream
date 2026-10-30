@@ -1,0 +1,106 @@
+--- a/ixwebsocket/IXWebSocketTransport.cpp
++++ b/ixwebsocket/IXWebSocketTransport.cpp
+@@ -354,7 +354,7 @@
+         }
+ 
+         // poll the socket
+-        PollResultType pollResult = _socket->isReadyToRead(lastingTimeoutDelayInMs);
++        PollResultType pollResult = _readPending ? PollResultType::ReadyForRead : _socket->isReadyToRead(lastingTimeoutDelayInMs);
+ 
+         // Make sure we send all the buffered data
+         // there can be a lot of it for large messages.
+@@ -517,6 +517,17 @@
+                 return;
+             }
+ 
++            // Bound declared frames and the complete fragmented message before copying.
++            const bool dataFrame = ws.opcode <= wsheader_type::BINARY_FRAME;
++            const size_t accumulated = dataFrame ? _fragmentedBytes : 0;
++            if (ws.N > 8 * 1024 * 1024 || accumulated > 8 * 1024 * 1024 - ws.N ||
++                (dataFrame && _chunks.size() >= 65536)) {
++                close(1009, "Message exceeds receive limit");
++                _rxbuf.clear();
++                _chunks.clear(); _fragmentedBytes = 0;
++                return;
++            }
++
+             if (ws.mask)
+             {
+                 ws.masking_key[0] = ((uint8_t) data[i + 0]) << 0;
+@@ -607,6 +618,7 @@
+                     // receive buffer fill out.
+                     //
+                     _chunks.emplace_back(frameData);
++                    _fragmentedBytes += frameData.size();
+ 
+                     if (ws.fin)
+                     {
+@@ -615,7 +627,7 @@
+                                     _receivedMessageCompressed,
+                                     onMessageCallback);
+ 
+-                        _chunks.clear();
++                        _chunks.clear(); _fragmentedBytes = 0;
+                         _receivedMessageCompressed = false;
+                     }
+                     else
+@@ -788,6 +800,10 @@
+         {
+             bool success = _perMessageDeflate->decompress(message, _decompressedMessage);
+ 
++            if (!success) {
++                close(1009, "Invalid or oversized compressed message");
++                return;
++            }
+             if (messageKind == MessageKind::MSG_TEXT && !validateUtf8(_decompressedMessage))
+             {
+                 close(WebSocketCloseConstants::kInvalidFramePayloadData,
+@@ -1090,6 +1106,7 @@
+ 
+     bool WebSocketTransport::receiveFromSocket()
+     {
++        _readPending = false;
+         while (true)
+         {
+             ssize_t ret = _socket->recv((char*) &_readbuf[0], _readbuf.size());
+@@ -1109,7 +1126,15 @@
+             }
+             else
+             {
++                if (_rxbuf.size() + static_cast<size_t>(ret) > 8 * 1024 * 1024 + 14 + _readbuf.size()) {
++                    close(1009, "Receive buffer exceeds limit");
++                    _rxbuf.clear();
++                    return false;
++                }
+                 _rxbuf.insert(_rxbuf.end(), _readbuf.begin(), _readbuf.begin() + ret);
++                // Dispatch between reads, then try another nonblocking read before polling.
++                _readPending = true;
++                break;
+             }
+         }
+ 
+--- a/ixwebsocket/IXWebSocketTransport.h
++++ b/ixwebsocket/IXWebSocketTransport.h
+@@ -157,6 +157,8 @@
+         // This could be a mix of control messages (Close, Ping, etc...) and
+         // data messages. That buffer is resized
+         std::vector<uint8_t> _rxbuf;
++        bool _readPending = false;
++        size_t _fragmentedBytes = 0;
+ 
+         // Contains all messages that are waiting to be sent
+         std::vector<uint8_t> _txbuf;
+--- a/ixwebsocket/IXWebSocketPerMessageDeflateCodec.cpp
++++ b/ixwebsocket/IXWebSocketPerMessageDeflateCodec.cpp
+@@ -240,6 +240,11 @@
+                 return false; // zlib error
+             }
+ 
++            const size_t produced = _compressBuffer.size() - _inflateState.avail_out;
++            if (produced > 8 * 1024 * 1024 - out.size()) {
++                out.clear();
++                return false;
++            }
+             out.append(reinterpret_cast<char*>(&_compressBuffer.front()),
+                        _compressBuffer.size() - _inflateState.avail_out);
+         } while (_inflateState.avail_out == 0);

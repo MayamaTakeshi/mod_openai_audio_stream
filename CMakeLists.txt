@@ -28,7 +28,24 @@ message(STATUS "FreeSWITCH modules dir: ${FS_MOD_DIR}")
 
 set(IXWEBSOCKET_INSTALL OFF CACHE BOOL "Disable ixwebsocket installation")
 option(USE_TLS "Use TLS for secure WebSocket connections" ON)
-add_subdirectory(libs/IXWebSocket)
+# Keep the pinned submodule pristine. Apply our receive limits to a build-local copy.
+find_program(PATCH_EXECUTABLE patch REQUIRED)
+set(IX_SOURCE_DIR "${CMAKE_CURRENT_BINARY_DIR}/ixwebsocket-source")
+file(COPY libs/IXWebSocket/ DESTINATION "${IX_SOURCE_DIR}" PATTERN ".git" EXCLUDE)
+foreach(IX_PATCH_FILE
+    ixwebsocket/IXWebSocketTransport.cpp
+    ixwebsocket/IXWebSocketTransport.h
+    ixwebsocket/IXWebSocketPerMessageDeflateCodec.cpp)
+    configure_file("libs/IXWebSocket/${IX_PATCH_FILE}" "${IX_SOURCE_DIR}/${IX_PATCH_FILE}" COPYONLY)
+endforeach()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS patches/ixwebsocket-receive-limits.patch)
+execute_process(COMMAND "${PATCH_EXECUTABLE}" -p1 --batch
+    -i "${CMAKE_CURRENT_SOURCE_DIR}/patches/ixwebsocket-receive-limits.patch"
+    WORKING_DIRECTORY "${IX_SOURCE_DIR}" RESULT_VARIABLE IX_PATCH_RESULT)
+if(NOT IX_PATCH_RESULT EQUAL 0)
+    message(FATAL_ERROR "Could not apply IXWebSocket receive limits")
+endif()
+add_subdirectory("${IX_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/ixwebsocket-build")
 
 add_library(mod_openai_audio_stream SHARED
     mod_openai_audio_stream.c
@@ -52,7 +69,7 @@ set_target_properties(mod_openai_audio_stream PROPERTIES
 target_compile_features(mod_openai_audio_stream PRIVATE c_std_99)
 
 target_include_directories(mod_openai_audio_stream PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/libs/IXWebSocket
+    ${IX_SOURCE_DIR}
     ${SPEEXDSP_INCLUDE_DIRS}
 )
 
@@ -66,3 +83,12 @@ target_link_libraries(mod_openai_audio_stream PRIVATE
 install(TARGETS ${PROJECT_NAME}
         COMPONENT ${PROJECT_NAME}
         DESTINATION ${FS_MOD_DIR})
+
+option(BUILD_MODULE_TESTS "Build tests requiring the module dependencies" OFF)
+if(BUILD_MODULE_TESTS)
+    enable_testing()
+    add_executable(test_receive_limits tests/unit/test_receive_limits.cpp)
+    target_compile_features(test_receive_limits PRIVATE cxx_std_11)
+    target_link_libraries(test_receive_limits PRIVATE ixwebsocket)
+    add_test(NAME test_receive_limits COMMAND test_receive_limits)
+endif()

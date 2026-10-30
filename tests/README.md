@@ -34,6 +34,20 @@ cmake --build build/tests --parallel "${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
 These tests compile the same `stream_protocol.cpp` and `base64.cpp` files linked into the FreeSWITCH module. No copied
 implementations or fake FreeSWITCH headers are used.
 
+## Module dependency tests
+
+The module build also tests the patched IXWebSocket decompressor at and above its 8 MiB limit:
+
+```sh
+cmake -S . -B build/module-tests -DBUILD_MODULE_TESTS=ON
+cmake --build build/module-tests --parallel 2
+(cd build/module-tests && ctest --output-on-failure)
+```
+
+This requires the regular module build dependencies, including `patch`. Use `-DENABLE_LOCAL=ON`
+when the FreeSWITCH SDK is installed under `/usr/local/freeswitch`. CI runs these tests before
+installing the module for integration tests.
+
 ## Integration tests
 
 The integration image is built from the `integration` target in `Dockerfile.ci`. It extends the CI SDK with the
@@ -41,7 +55,9 @@ pinned FreeSWITCH runtime, its test configuration, and Python. The module and te
 they are built from the current checkout and executed every time the container starts.
 
 The mock server sends known PCM16 tones which are recorded from the FreeSWITCH channel and checked for audible
-duration and dominant frequency, exercising the playback queue and resampling path end to end. A compatibility
+duration and dominant frequency, exercising the playback queue and resampling path end to end. Additional scenarios cover concurrent stop/hangup, live-unload rejection, stalled-peer send
+backpressure, capture backlog after reconnection, and oversized declared, fragmented, and
+compressed WebSocket messages. A compatibility
 scenario also reuses `response_id` for a later response and verifies that the peer-provided ID does not suppress
 valid playback audio.
 

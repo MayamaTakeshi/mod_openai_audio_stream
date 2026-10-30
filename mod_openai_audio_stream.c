@@ -279,6 +279,7 @@ static switch_status_t stream_api_execute(switch_stream_handle_t *stream, switch
     char *mycmd = NULL, *argv[8] = {0};
     int argc = 0;
     void *lifecycle_guard = NULL;
+    void *closing_bug = NULL;
 
     switch_status_t status = SWITCH_STATUS_FALSE;
 
@@ -321,6 +322,7 @@ static switch_status_t stream_api_execute(switch_stream_handle_t *stream, switch
                                       "%s contains invalid utf8 characters\n", argv[2]);
                     goto release_session;
                 }
+                closing_bug = switch_channel_get_private(switch_core_session_get_channel(lsession), MY_BUG_NAME);
                 status = do_stop(lsession, argc > 2 ? argv[2] : NULL);
                 break;
             case STREAM_CMD_PAUSE:
@@ -438,6 +440,9 @@ static switch_status_t stream_api_execute(switch_stream_handle_t *stream, switch
 
     release_session:
         stream_session_lifecycle_unlock(lifecycle_guard);
+        /* CLOSE takes the lifecycle lock: prune only after releasing it. */
+        switch_core_media_bug_prune(lsession);
+        stream_session_wait_closed(lsession, closing_bug);
         switch_core_session_rwunlock(lsession);
     } else {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error locating session %s\n",
@@ -508,8 +513,9 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_openai_audio_stream_load) {
 
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_openai_audio_stream API successfully loaded\n");
 
-    /* indicate that the module should continue to be loaded */
-    return SWITCH_STATUS_SUCCESS;
+    /* Media callbacks and WebSocket threads outlive API invocations. Keep the
+     * DSO resident until process shutdown; live reload is not supported. */
+    return SWITCH_STATUS_NOUNLOAD;
 }
 
 /*

@@ -21,6 +21,7 @@ switch_status_t stream_session_start(void *pUserData);
 void stream_session_release(void *pUserData);
 void *stream_session_lifecycle_lock(switch_core_session_t *session);
 void stream_session_lifecycle_unlock(void *handle);
+void stream_session_wait_closed(switch_core_session_t *session, void *closing_bug);
 switch_bool_t stream_frame(switch_media_bug_t *bug);
 switch_bool_t write_frame(switch_core_session_t *session, switch_media_bug_t *bug);
 switch_status_t stream_session_cleanup(switch_core_session_t *session, char *text, int channelIsClosing);

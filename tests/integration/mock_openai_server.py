@@ -5,6 +5,7 @@ import base64
 import json
 import math
 import struct
+import time
 from pathlib import Path
 
 import websockets
@@ -24,18 +25,44 @@ class MockRealtimeServer:
         self.event_log = event_log
         self.ready_file = ready_file
         self._lock = asyncio.Lock()
+        self.handshakes = {}
 
     async def record(self, event, **fields):
-        payload = {"event": event, **fields}
+        payload = {"event": event, "timestamp": time.monotonic(), **fields}
         async with self._lock:
             with self.event_log.open("a", encoding="utf-8") as log:
                 log.write(json.dumps(payload, sort_keys=True) + "\n")
 
+    async def handshake(self, path, headers):
+        self.handshakes[path] = self.handshakes.get(path, 0) + 1
+        if path == "/slow-reconnect" and self.handshakes[path] > 1:
+            await asyncio.sleep(1)
+
     async def handle(self, websocket, path=None):
         path = path or getattr(websocket, "path", "/")
-        await self.record("connected", path=path)
+        await self.record("connected", path=path, generation=self.handshakes.get(path, 0))
 
         try:
+            if path == "/stall-read":
+                websocket.transport.pause_reading()
+                await asyncio.sleep(10)
+                websocket.transport.resume_reading()
+            if path == "/slow-reconnect" and self.handshakes[path] == 1:
+                await websocket.close(code=1011, reason="reconnect regression")
+                return
+            if path in ("/oversized-declared", "/oversized-fragments", "/oversized-compressed"):
+                if path == "/oversized-compressed":
+                    await websocket.send("a" * (8 * 1024 * 1024 + 1))
+                elif path == "/oversized-declared":
+                    # Only the header: reject the length before receiving its body.
+                    websocket.transport.write(bytes([0x82, 127]) + struct.pack("!Q", 8 * 1024 * 1024 + 1))
+                else:
+                    chunk = b"a" * (5 * 1024 * 1024)
+                    websocket.transport.write(bytes([0x02, 127]) + struct.pack("!Q", len(chunk)) + chunk)
+                    websocket.transport.write(bytes([0x80, 127]) + struct.pack("!Q", len(chunk)))
+                await websocket.wait_closed()
+                await self.record("limit-close", path=path, code=websocket.close_code)
+                return
             if path == "/close-immediately":
                 await websocket.close(code=1011, reason="intentional integration-test close")
                 await self.record("closed", path=path)
@@ -158,7 +185,7 @@ class MockRealtimeServer:
     async def run(self, host, port):
         self.event_log.unlink(missing_ok=True)
         self.ready_file.unlink(missing_ok=True)
-        async with websockets.serve(self.handle, host, port, max_size=16 * 1024 * 1024):
+        async with websockets.serve(self.handle, host, port, max_size=16 * 1024 * 1024, process_request=self.handshake):
             self.ready_file.touch()
             await asyncio.Future()
 

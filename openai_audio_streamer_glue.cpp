@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
 #include <atomic>
 #include <cstdint>
 #include <utility>
@@ -651,6 +652,7 @@ class AudioStreamer {
     // For all write methods, success means the payload was accepted by the WebSocket client while
     // connected; delivery to the server is not confirmed.
     bool writeAudioDelta(const uint8_t *buffer, size_t len) {
+        std::lock_guard<std::mutex> lock(m_send_mutex);
         if (!this->isConnected())
             return false;
         // Convert the buffer to PCM16 and then base64 encode it.
@@ -664,7 +666,8 @@ class AudioStreamer {
         cJSON_AddStringToObject(root, "audio", base64Audio.c_str());
 
         char *jsonStr = cJSON_PrintUnformatted(root);
-        const bool sent = jsonStr && webSocket.sendUtf8Text(ix::IXWebSocketSendData(jsonStr, strlen(jsonStr))).success;
+        const bool sent = jsonStr && send_capacity(strlen(jsonStr)) &&
+                          webSocket.sendUtf8Text(ix::IXWebSocketSendData(jsonStr, strlen(jsonStr))).success;
 
         cJSON_Delete(root);
         switch_safe_free(jsonStr);
@@ -672,6 +675,8 @@ class AudioStreamer {
     }
 
     bool writeBinary(const uint8_t *buffer, size_t len) {
+        std::lock_guard<std::mutex> lock(m_send_mutex);
+        if (!send_capacity(len)) return false;
         if (!this->isConnected())
             return false;
         return webSocket.sendBinary(ix::IXWebSocketSendData(reinterpret_cast<const char *>(buffer), len)).success;
@@ -693,6 +698,8 @@ class AudioStreamer {
     }
 
     bool writeText(const char *text) { // Openai only accepts json not utf8 plain text
+        std::lock_guard<std::mutex> lock(m_send_mutex);
+        if (!send_capacity(strlen(text))) return false;
         if (!this->isConnected())
             return false;
         return webSocket.sendUtf8Text(ix::IXWebSocketSendData(text, strlen(text))).success;
@@ -778,6 +785,13 @@ class AudioStreamer {
     }
 
   private:
+    // Serialize admission with sends from media and API threads. Reserve space for
+    // framing/compression overhead; transport buffering is checked on every send.
+    std::mutex m_send_mutex;
+    bool send_capacity(size_t bytes) {
+        const size_t limit = 1024 * 1024;
+        return bytes <= limit / 2 && webSocket.bufferedAmount() <= limit / 2;
+    }
     size_t max_playback_queue_samples() const {
         return static_cast<size_t>(out_sample_rate) * MAX_PLAYBACK_QUEUE_SECONDS;
     }
@@ -824,6 +838,7 @@ struct LifecycleLockHandle {
         : session_id(std::move(id)), mutex(std::move(session_mutex)), lock(*mutex) {}
 };
 
+std::condition_variable_any lifecycle_closed;
 std::mutex lifecycle_registry_mutex;
 std::unordered_map<std::string, std::weak_ptr<LifecycleMutex>> lifecycle_mutexes;
 
@@ -1025,6 +1040,18 @@ void *stream_session_lifecycle_lock(switch_core_session_t *session) {
 
 void stream_session_lifecycle_unlock(void *handle) {
     release_lifecycle_lock(static_cast<LifecycleLockHandle *>(handle));
+}
+
+void stream_session_wait_closed(switch_core_session_t *session, void *closing_bug) {
+    if (!closing_bug) return;
+    auto *handle = acquire_lifecycle_lock(session);
+    if (!handle) return;
+    // A media thread may have removed the bug before our prune call. Wait for
+    // that thread's CLOSE to finish too, without holding the lifecycle mutex.
+    lifecycle_closed.wait(handle->lock, [session, closing_bug] {
+        return switch_channel_get_private(switch_core_session_get_channel(session), MY_BUG_NAME) != closing_bug;
+    });
+    release_lifecycle_lock(handle);
 }
 
 int validate_ws_uri(const char *url, char *wsUri) {
@@ -1408,8 +1435,11 @@ switch_status_t stream_session_start(void *pUserData) {
 
 switch_bool_t stream_frame(switch_media_bug_t *bug) {
     auto *tech_pvt = static_cast<private_t *>(switch_core_media_bug_get_user_data(bug));
-    if (!tech_pvt || switch_atomic_read(&tech_pvt->audio_paused) || switch_atomic_read(&tech_pvt->user_audio_muted))
+    if (!tech_pvt) return SWITCH_TRUE;
+    if (switch_atomic_read(&tech_pvt->audio_paused) || switch_atomic_read(&tech_pvt->user_audio_muted)) {
+        switch_core_media_bug_flush(bug);
         return SWITCH_TRUE;
+    }
 
     if (switch_mutex_trylock(tech_pvt->mutex) != SWITCH_STATUS_SUCCESS) {
         return SWITCH_TRUE;
@@ -1418,13 +1448,18 @@ switch_bool_t stream_frame(switch_media_bug_t *bug) {
     auto *pAudioStreamer = static_cast<AudioStreamer *>(tech_pvt->pAudioStreamer);
 
     if (!pAudioStreamer || !pAudioStreamer->isConnected()) {
+        switch_core_media_bug_flush(bug);
+        switch_buffer_zero(tech_pvt->sbuffer);
+        if (tech_pvt->resampler) speex_resampler_reset_mem(tech_pvt->resampler);
         switch_mutex_unlock(tech_pvt->mutex);
         return SWITCH_TRUE;
     }
 
     // Discard any capture residue left over from a dropped connection
     if (pAudioStreamer->consume_capture_reset() && tech_pvt->sbuffer) {
+        switch_core_media_bug_flush(bug);
         switch_buffer_zero(tech_pvt->sbuffer);
+        if (tech_pvt->resampler) speex_resampler_reset_mem(tech_pvt->resampler);
     }
 
     // Get persistent buffers (allocated once per session, reused across all frames)
@@ -1564,12 +1599,15 @@ switch_bool_t write_frame(switch_core_session_t *session, switch_media_bug_t *bu
         return SWITCH_TRUE;
     }
 
-    uint32_t bytes_needed = frame->datalen;
-    uint32_t bytes_per_sample = frame->datalen / frame->samples;
+    const uint32_t channels = frame->channels ? frame->channels : codec->implementation->number_of_channels;
+    if (!channels || frame->datalen % (channels * sizeof(int16_t))) return SWITCH_TRUE;
+    const uint32_t bytes_per_sample = channels * sizeof(int16_t);
+    uint32_t bytes_needed = std::min(frame->datalen, frame->buflen);
+    bytes_needed -= bytes_needed % bytes_per_sample;
+    // The queue holds mono PCM. Consume one sample per destination sample time.
+    bytes_needed /= channels;
 
-    if (bytes_needed > frame->buflen) { // may be useless
-        bytes_needed = frame->buflen;
-    }
+    if (!bytes_needed) return SWITCH_TRUE;
 
     uint32_t inuse = switch_buffer_inuse(tech_pvt->playback_buffer);
 
@@ -1630,8 +1668,12 @@ switch_bool_t write_frame(switch_core_session_t *session, switch_media_bug_t *bu
             as->openai_speech_started();
         }
 
-        frame->datalen = bytes_needed;
-        frame->samples = bytes_needed / bytes_per_sample;
+        // Expand backwards in place so source mono samples are never overwritten.
+        auto *samples = static_cast<int16_t *>(frame->data);
+        const size_t sample_count = bytes_needed / sizeof(int16_t);
+        stream_protocol::expand_mono_pcm(samples, sample_count, channels);
+        frame->datalen = bytes_needed * channels;
+        frame->samples = sample_count;
 
         switch_core_media_bug_set_write_replace_frame(bug, frame);
     }
@@ -1655,8 +1697,9 @@ switch_status_t stream_session_cleanup(switch_core_session_t *session, char *tex
         if (!tech_pvt) {
             // should not happen: the bug is always created with user data
             switch_channel_set_private(channel, MY_BUG_NAME, nullptr);
-            if (!channelIsClosing && switch_core_media_bug_remove(session, &bug) != SWITCH_STATUS_SUCCESS) {
-                switch_channel_set_private(channel, MY_BUG_NAME, bug);
+            lifecycle_closed.notify_all();
+            if (!channelIsClosing) {
+                switch_core_media_bug_set_flag(bug, SMBF_PRUNE);
             }
             return SWITCH_STATUS_FALSE;
         }
@@ -1676,23 +1719,21 @@ switch_status_t stream_session_cleanup(switch_core_session_t *session, char *tex
             status = stream_session_send_json(session, text);
         }
 
-        // Detach and remove the media bug while its user data is still alive. Once remove
-        // returns, no media callback can race the synchronous WebSocket teardown below.
-        switch_channel_set_private(channel, MY_BUG_NAME, nullptr);
-        if (!channelIsClosing && switch_core_media_bug_remove(session, &bug) != SWITCH_STATUS_SUCCESS) {
-            // FreeSWITCH may refuse removal while a bug is thread-locked. Keep the context alive
-            // and reachable so media callbacks cannot observe freed user data.
-            switch_channel_set_private(channel, MY_BUG_NAME, bug);
+        if (!channelIsClosing) {
+            // Mark while serialized with other commands. The API prunes after dropping
+            // its lifecycle lock, so hangup's CLOSE callback cannot invert the locks.
+            switch_core_media_bug_set_flag(bug, SMBF_PRUNE);
             switch_mutex_unlock(tech_pvt->mutex);
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                              "(%s) stream_session_cleanup: failed to remove media bug\n", sessionId);
-            return SWITCH_STATUS_FALSE;
+            return status;
         }
+
+        switch_channel_set_private(channel, MY_BUG_NAME, nullptr);
 
         finish(tech_pvt);
 
         switch_mutex_unlock(tech_pvt->mutex);
         destroy_tech_pvt(tech_pvt);
+        lifecycle_closed.notify_all();
 
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
                           "(%s) stream_session_cleanup: connection closed\n", sessionId);

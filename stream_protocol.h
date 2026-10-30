@@ -2,8 +2,12 @@
 #define STREAM_PROTOCOL_H
 
 #include <cstddef>
+#include <cstdint>
 
 namespace stream_protocol {
+
+// Expand mono PCM in place; the caller supplies sample_count * channels capacity.
+void expand_mono_pcm(int16_t *samples, std::size_t sample_count, unsigned channels);
 
 enum class JsonMessageType {
     Error,
